@@ -117,8 +117,10 @@ def parse_episode(url: str) -> dict:
         "url": url,
     }
 
-def extract_category_items(html_text: str, category_title: str):
+def extract_category_items(html_text: str, category_title: str, debug: bool = False):
     soup = BeautifulSoup(html_text, "html.parser")
+
+    diag_root = {"rounds": []} if debug else None
 
     # ---------- helpers ----------
     def _norm_cat(s: str) -> str:
@@ -156,7 +158,11 @@ def extract_category_items(html_text: str, category_title: str):
     # ---------- round extractor using clue ids ----------
     def extract_from_round(round_id: str):
         tbl = soup.select_one(f"table#{round_id}")
+        round_diag = {"round": round_id}
         if not tbl:
+            if debug:
+                round_diag.update({"found": False, "reason": "table not found"})
+                diag_root["rounds"].append(round_diag)
             return None
 
         # Map round id to clue id prefix and expected values
@@ -171,13 +177,19 @@ def extract_category_items(html_text: str, category_title: str):
         cats_norm = [_norm_cat(c) for c in raw_categories]
         target = _norm_cat(category_title)
         if target not in cats_norm:
+            if debug:
+                round_diag.update({"found": False, "reason": "category not present", "categories": cats_norm})
+                diag_root["rounds"].append(round_diag)
             return None
         col_idx = cats_norm.index(target)          # 0-based index into categories
         col_num = col_idx + 1                      # 1..6 for clue ids
+        if debug:
+            round_diag.update({"found": True, "col_index": col_idx, "rows": []})
 
         items = []
         # Rows on the board are numbered top-to-bottom 1..5
         for row_num in range(1, 6):
+            row_diag = {"row": row_num} if debug else None
             # Try the canonical per-clue cell id
             cell = soup.select_one(f'td#clue_{prefix}_{col_num}_{row_num}')
             if not cell:
@@ -187,44 +199,60 @@ def extract_category_items(html_text: str, category_title: str):
                 if cell and cell.name == "div":
                     parent_td = cell.find_parent("td")
                     cell = parent_td or cell
+            if debug:
+                row_diag and row_diag.update({"has_cell": bool(cell)})
 
             if not cell:
-                return None  # missing cell -> cannot produce 5 verified items
+                if debug:
+                    row_diag and row_diag.update({"reason": "missing clue cell"})
+                    round_diag["rows"].append(row_diag)
+                    round_diag["failed_row"] = row_num
+                    diag_root["rounds"].append(round_diag)
+                return None
 
             # Clue text: prefer .clue_text; otherwise the cell text minus value label
             clue_text_el = cell.select_one(".clue_text, td.clue_text, div.clue_text")
             clue_raw = _extract_text(clue_text_el)
             if not clue_raw:
-                # Sometimes the text sits in a descendant without the class
-                # Grab the longest text node in the cell as fallback
                 cand = cell.get_text(" ", strip=True)
-                # Remove the value string like $200/$400... if present
                 for v in ["$200", "$400", "$600", "$800", "$1000", "$1200", "$1600", "$2000"]:
                     cand = cand.replace(v, "").strip()
                 clue_raw = cand
+            if debug:
+                row_diag and row_diag.update({"has_clue": bool(clue_raw)})
 
             # Correct response: modern first, then legacy onmouseover
             answer_exact = ""
             correct_el = cell.select_one(".correct_response, em.correct_response")
             if correct_el:
                 answer_exact = _extract_text(correct_el)
+                used = "modern"
+            else:
+                used = None
 
             if not answer_exact:
-                # Try a sibling/descendant container with the same id (some pages stash answers there)
                 info_div = soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}')
                 if info_div:
                     correct_el2 = info_div.select_one(".correct_response, em.correct_response")
                     if correct_el2:
                         answer_exact = _extract_text(correct_el2)
+                        used = used or "info_div"
 
             if not answer_exact:
-                # Legacy: onmouseover HTML snippet
                 holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
                 if holder:
                     answer_exact = _decode_onmouseover(holder.get("onmouseover", ""))
+                    used = used or "onmouseover"
 
-            # Daily Double cells can hide the value; that's fine—value list is fixed per row
+            if debug:
+                row_diag and row_diag.update({"has_answer": bool(answer_exact), "answer_source": used})
+
             if not clue_raw or not answer_exact:
+                if debug:
+                    row_diag and row_diag.update({"reason": "missing clue or answer"})
+                    round_diag["rows"].append(row_diag)
+                    round_diag["failed_row"] = row_num
+                    diag_root["rounds"].append(round_diag)
                 return None
 
             items.append({
@@ -232,36 +260,39 @@ def extract_category_items(html_text: str, category_title: str):
                 "clue_raw": clue_raw,
                 "answer_exact": answer_exact,
             })
+            if debug:
+                round_diag["rows"].append(row_diag)
 
-        # Must be exactly five complete items
-        if len(items) != 5 or any(not it["clue_raw"] or not it["answer_exact"] for it in items):
+        if len(items) != 5:
+            if debug:
+                round_diag["reason"] = "not exactly five items"
+                diag_root["rounds"].append(round_diag)
             return None
+
+        if debug:
+            round_diag["success"] = True
+            diag_root["rounds"].append(round_diag)
         return items
 
     # Try Jeopardy, then Double Jeopardy
     for rid in ["jeopardy_round", "double_jeopardy_round"]:
         res = extract_from_round(rid)
         if res:
-            return res
-    return None
+            return res, (diag_root if debug else None)
+    return None, (diag_root if debug else None)
 
 @router.get("/extract")
-def extract(
-    episode_url: str = Query(..., description="Full J! Archive episode URL"),
-    category: str = Query(..., description="Exact category title as shown on the board"),
-):
+def ja_extract(episode_url: str = Query(...), category: str = Query(...), debug: bool = Query(False)):
     ep = parse_episode(episode_url)
-    items = extract_category_items(ep["html"], category)
-    if not items or any(not x["clue_raw"] or not x["answer_exact"] for x in items):
-        raise HTTPException(status_code=422, detail="Could not extract five verified items for that category.")
+    items, diag = extract_category_items(ep["html"], category, debug=debug)
+    if not items:
+        raise HTTPException(status_code=422, detail="Could not extract five verified items for that category.", headers={"X-Debug": "1" if debug else "0"})
     return {
         "episode_air_date": ep["air_date"],
         "episode_number": ep["episode_number"],
         "category": category,
         "items": items,
-        "source": "J! Archive",
-        "episode_url": ep["url"],
-        "notes": "",
+        "debug": diag if debug else None,
     }
 
 
