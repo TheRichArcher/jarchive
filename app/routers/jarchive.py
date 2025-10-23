@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 import html
 import html as _html
 import requests
@@ -15,51 +16,79 @@ HEADERS = {
 def _extract_title_text(soup: BeautifulSoup) -> str:
     # Try several known locations for the game title
     for sel in [
-        "div#game_title h1",         # most common
-        "div#game_title",            # sometimes not an h1
-        "h1#game_title",             # rare
-        "h1",                        # fallback
-        "div#content h1",            # older templates
+        "div#game_title h1",
+        "div#game_title",
+        "h1#game_title",
+        "div#content h1",
+        "h1",
+        "title",
     ]:
         el = soup.select_one(sel)
         if el:
             t = el.get_text(" ", strip=True)
             if t:
                 return t
-    # Ultimate fallback: page title
-    if soup.title and soup.title.string:
-        return soup.title.get_text(" ", strip=True)
     return ""
 
+MONTH_NAME_PAT = r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+TEXTUAL_DATE_PAT = rf"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday,\s*)?{MONTH_NAME_PAT}\s+\d{{1,2}},\s+\d{{4}}"
+
+def _to_iso_date(date_str: str) -> str | None:
+    """Normalize either YYYY-MM-DD or 'Month D, YYYY' to YYYY-MM-DD."""
+    s = " ".join(date_str.strip().split())
+    # Already ISO?
+    m = re.fullmatch(r"\d{4}-\d{2}-\d{2}", s)
+    if m:
+        return s
+    # Try textual dates like 'Wednesday, March 6, 2013' or 'March 6, 2013'
+    for fmt in ["%A, %B %d, %Y", "%B %d, %Y"]:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
 def _parse_episode_meta(text: str):
-    # Normalize whitespace and punctuation variants
     t = " ".join(text.split())
 
-    # Try several formats seen across the archive over the years
-    patterns = [
+    # 1) Direct ISO patterns
+    patterns_iso = [
         r"Show #(\d+), aired (\d{4}-\d{2}-\d{2})",
         r"Show #(\d+)\s*-\s*(\d{4}-\d{2}-\d{2})",
         r"Show #(\d+)\s*\((\d{4}-\d{2}-\d{2})\)",
         r"Show #(\d+)\s*aired[: ]+(\d{4}-\d{2}-\d{2})",
-        r"aired[: ]+(\d{4}-\d{2}-\d{2}).*Show #(\d+)",  # reversed order
+        r"aired[: ]+(\d{4}-\d{2}-\d{2}).*Show #(\d+)",
     ]
-    for pat in patterns:
+    for pat in patterns_iso:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            # Ensure we always return as (episode_number, air_date)
             g1, g2 = m.group(1), m.group(2)
-            if "aired" in pat and pat.startswith("aired"):
-                # pattern with reversed order
-                air_date, ep_num = g1, g2
+            if pat.startswith("aired"):
+                air_date_iso, ep_num = _to_iso_date(g1), g2
             else:
-                ep_num, air_date = g1, g2
-            return ep_num, air_date
+                ep_num, air_date_iso = g1, _to_iso_date(g2)
+            if air_date_iso:
+                return ep_num, air_date_iso
 
-    # If we can’t find both, try to find them separately
+    # 2) Textual date patterns
+    pat_textual = rf"Show #(\d+)[\s\-–—:]*({TEXTUAL_DATE_PAT})"
+    m = re.search(pat_textual, t, flags=re.IGNORECASE)
+    if m:
+        ep_num, date_str = m.group(1), m.group(2)
+        air_date_iso = _to_iso_date(date_str)
+        if air_date_iso:
+            return ep_num, air_date_iso
+
+    # 3) Last resort: find ep and any date separately
     m_ep = re.search(r"Show #(\d+)", t, flags=re.IGNORECASE)
-    m_dt = re.search(r"(\d{4}-\d{2}-\d{2})", t)
-    if m_ep and m_dt:
-        return m_ep.group(1), m_dt.group(1)
+    m_dt_iso = re.search(r"(\d{4}-\d{2}-\d{2})", t)
+    m_dt_text = re.search(TEXTUAL_DATE_PAT, t, flags=re.IGNORECASE)
+    if m_ep and (m_dt_iso or m_dt_text):
+        ep = m_ep.group(1)
+        date_str = (m_dt_iso or m_dt_text).group(0)
+        air_date_iso = _to_iso_date(date_str)
+        if air_date_iso:
+            return ep, air_date_iso
 
     return None, None
 
