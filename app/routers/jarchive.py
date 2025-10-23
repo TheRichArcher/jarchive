@@ -1,5 +1,6 @@
 import re
 import html
+import html as _html
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Query
@@ -87,8 +88,17 @@ def parse_episode(url: str) -> dict:
         "url": url,
     }
 
+def _norm_cat(s: str) -> str:
+    if not s:
+        return ""
+    s = _html.unescape(s)
+    s = s.replace("&", "and")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
+
 def extract_category_items(html_text: str, category_title: str):
     soup = BeautifulSoup(html_text, "html.parser")
+    target = _norm_cat(category_title)
 
     def parse_correct_response_from_onmouseover(attr_val: str) -> str:
         """
@@ -118,10 +128,11 @@ def extract_category_items(html_text: str, category_title: str):
             return None
 
         # Columns (categories) at top of the table
-        categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
-        if category_title not in categories:
+        raw_categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
+        categories_norm = [_norm_cat(c) for c in raw_categories]
+        if target not in categories_norm:
             return None
-        col_idx = categories.index(category_title)
+        col_idx = categories_norm.index(target)
 
         # Determine expected board values by round
         if round_id == "double_jeopardy_round":
