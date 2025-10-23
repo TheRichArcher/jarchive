@@ -117,113 +117,132 @@ def parse_episode(url: str) -> dict:
         "url": url,
     }
 
-def _norm_cat(s: str) -> str:
-    if not s:
-        return ""
-    s = _html.unescape(s)
-    s = s.replace("&", "and")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s.upper()
-
 def extract_category_items(html_text: str, category_title: str):
     soup = BeautifulSoup(html_text, "html.parser")
-    target = _norm_cat(category_title)
 
-    def parse_correct_response_from_onmouseover(attr_val: str) -> str:
-        """
-        Older J! Archive stores a small HTML snippet in the onmouseover attribute.
-        Example contains: <em class="correct_response">ANSWER</em>
-        We unescape and then regex out the inner text.
-        """
+    # ---------- helpers ----------
+    def _norm_cat(s: str) -> str:
+        if not s:
+            return ""
+        s = html.unescape(s)
+        s = s.replace("&", "and")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s.upper()
+
+    def _decode_onmouseover(attr_val: str) -> str:
         if not attr_val:
             return ""
         try:
             unescaped = html.unescape(attr_val)
-            # Common patterns: <em class="correct_response">X</em> or <em>X</em>
-            m = re.search(r'<em[^>]*class=["\']?correct_response["\']?[^>]*>(.*?)</em>', unescaped, flags=re.IGNORECASE|re.DOTALL)
+            # Prefer classed correct_response
+            m = re.search(
+                r'<em[^>]*class=["\']?correct_response["\']?[^>]*>(.*?)</em>',
+                unescaped,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
             if m:
                 return BeautifulSoup(m.group(1), "html.parser").get_text(" ", strip=True)
-            # Fallback: any <em>…</em>
-            m2 = re.search(r'<em[^>]*>(.*?)</em>', unescaped, flags=re.IGNORECASE|re.DOTALL)
+            # Fallback: any <em>...</em>
+            m2 = re.search(r"<em[^>]*>(.*?)</em>", unescaped, flags=re.IGNORECASE | re.DOTALL)
             if m2:
                 return BeautifulSoup(m2.group(1), "html.parser").get_text(" ", strip=True)
         except Exception:
             pass
         return ""
 
+    def _extract_text(el):
+        return el.get_text(" ", strip=True) if el else ""
+
+    # ---------- round extractor using clue ids ----------
     def extract_from_round(round_id: str):
         tbl = soup.select_one(f"table#{round_id}")
         if not tbl:
             return None
 
-        # Columns (categories) at top of the table
-        raw_categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
-        categories_norm = [_norm_cat(c) for c in raw_categories]
-        if target not in categories_norm:
-            return None
-        col_idx = categories_norm.index(target)
-
-        # Determine expected board values by round
+        # Map round id to clue id prefix and expected values
         if round_id == "double_jeopardy_round":
+            prefix = "DJ"
             norm_values = ["$400", "$800", "$1200", "$1600", "$2000"]
         else:
+            prefix = "J"
             norm_values = ["$200", "$400", "$600", "$800", "$1000"]
 
-        # Each row with clues has 6 td.clue cells (one per category column).
-        # Some cells may be missing; we keep placeholders and only count valid ones.
+        raw_categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
+        cats_norm = [_norm_cat(c) for c in raw_categories]
+        target = _norm_cat(category_title)
+        if target not in cats_norm:
+            return None
+        col_idx = cats_norm.index(target)          # 0-based index into categories
+        col_num = col_idx + 1                      # 1..6 for clue ids
+
         items = []
-        for r in tbl.select("tr"):
-            cells = r.select("td.clue")
-            if len(cells) < 6:
-                continue
-            cell = cells[col_idx]
+        # Rows on the board are numbered top-to-bottom 1..5
+        for row_num in range(1, 6):
+            # Try the canonical per-clue cell id
+            cell = soup.select_one(f'td#clue_{prefix}_{col_num}_{row_num}')
+            if not cell:
+                # Some legacy templates wrap with a div with that id; try that too
+                cell = soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}')
+                # If it's a div container, move to its closest td for onmouseover, etc.
+                if cell and cell.name == "div":
+                    parent_td = cell.find_parent("td")
+                    cell = parent_td or cell
 
-            # Clue text
+            if not cell:
+                return None  # missing cell -> cannot produce 5 verified items
+
+            # Clue text: prefer .clue_text; otherwise the cell text minus value label
             clue_text_el = cell.select_one(".clue_text, td.clue_text, div.clue_text")
-            clue_text = clue_text_el.get_text(" ", strip=True) if clue_text_el else ""
+            clue_raw = _extract_text(clue_text_el)
+            if not clue_raw:
+                # Sometimes the text sits in a descendant without the class
+                # Grab the longest text node in the cell as fallback
+                cand = cell.get_text(" ", strip=True)
+                # Remove the value string like $200/$400... if present
+                for v in ["$200", "$400", "$600", "$800", "$1000", "$1200", "$1600", "$2000"]:
+                    cand = cand.replace(v, "").strip()
+                clue_raw = cand
 
-            # Correct response: modern first, legacy fallback
+            # Correct response: modern first, then legacy onmouseover
             answer_exact = ""
             correct_el = cell.select_one(".correct_response, em.correct_response")
             if correct_el:
-                answer_exact = correct_el.get_text(" ", strip=True)
+                answer_exact = _extract_text(correct_el)
 
             if not answer_exact:
-                # Legacy: attribute contains mini HTML
-                # Often on the <td class="clue"> itself or on a <div> child
-                onmouseover_holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
-                if onmouseover_holder:
-                    answer_exact = parse_correct_response_from_onmouseover(onmouseover_holder.get("onmouseover", ""))
+                # Try a sibling/descendant container with the same id (some pages stash answers there)
+                info_div = soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}')
+                if info_div:
+                    correct_el2 = info_div.select_one(".correct_response, em.correct_response")
+                    if correct_el2:
+                        answer_exact = _extract_text(correct_el2)
 
-            # Only append if we found at least clue or answer (some cells are empty)
-            if clue_text or answer_exact:
-                items.append({"clue_raw": clue_text, "answer_exact": answer_exact})
+            if not answer_exact:
+                # Legacy: onmouseover HTML snippet
+                holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
+                if holder:
+                    answer_exact = _decode_onmouseover(holder.get("onmouseover", ""))
 
-            # Stop early if we already have 5
-            if len(items) >= 5:
-                break
+            # Daily Double cells can hide the value; that's fine—value list is fixed per row
+            if not clue_raw or not answer_exact:
+                return None
 
-        # Enforce exactly five items in board (top-to-bottom) order for that column
-        if len(items) < 5:
-            return None
-        result = []
-        for i in range(5):
-            it = items[i]
-            result.append({
-                "value": norm_values[i],
-                "clue_raw": it.get("clue_raw", ""),
-                "answer_exact": it.get("answer_exact", ""),
+            items.append({
+                "value": norm_values[row_num - 1],
+                "clue_raw": clue_raw,
+                "answer_exact": answer_exact,
             })
-        # Require both clue_raw and answer_exact for all five
-        if any(not x["clue_raw"] or not x["answer_exact"] for x in result):
-            return None
-        return result
 
-    # Try Jeopardy then Double Jeopardy
+        # Must be exactly five complete items
+        if len(items) != 5 or any(not it["clue_raw"] or not it["answer_exact"] for it in items):
+            return None
+        return items
+
+    # Try Jeopardy, then Double Jeopardy
     for rid in ["jeopardy_round", "double_jeopardy_round"]:
-        items = extract_from_round(rid)
-        if items:
-            return items
+        res = extract_from_round(rid)
+        if res:
+            return res
     return None
 
 @router.get("/extract")
