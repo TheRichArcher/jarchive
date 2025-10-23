@@ -212,6 +212,15 @@ def extract_category_items(html_text: str, category_title: str, debug: bool = Fa
                         answer_exact = _extract_text(correct_el2); source = "info_div.correct_response"
 
             if not answer_exact:
+                # Fallback: many legacy pages store the answer in a sibling td with _r suffix
+                answer_td = soup.select_one(f'td#clue_{prefix}_{col_num}_{row_num}_r')
+                if answer_td:
+                    correct_el3 = answer_td.select_one('.correct_response, em.correct_response')
+                    if correct_el3:
+                        answer_exact = _extract_text(correct_el3)
+                        source = 'answer_td_r'
+
+            if not answer_exact:
                 holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
                 if holder:
                     answer_exact = _decode_onmouseover(holder.get("onmouseover", "")); source = "onmouseover"
