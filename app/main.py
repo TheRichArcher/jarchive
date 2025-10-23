@@ -1,17 +1,24 @@
 from fastapi import FastAPI
+from app.routers import jarchive
 
-from app.routers.jarchive import router as jarchive_router
+app = FastAPI(title="J! Archive Verifier API")
 
+# Mount our router at /ja
+app.include_router(jarchive.router)
 
-app = FastAPI(title="jarchive-verifier")
+# Root handlers so Render’s primary URL returns JSON instead of 404
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"ok": True, "service": "jarchive-verifier"}
 
+@app.head("/", include_in_schema=False)
+async def root_head():
+    # Respond 200 to Render/ELB health probes
+    return {}
 
-# Routers (router has its own prefix/tags)
-app.include_router(jarchive_router)
-
-
-@app.get("/")
-def root():
-    return {"service": "jarchive-verifier", "status": "ok"}
+# Simple health endpoint (optional but useful)
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
 
 
