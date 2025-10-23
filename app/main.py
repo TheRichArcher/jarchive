@@ -6,8 +6,8 @@ from app.routers.jarchive import router as jarchive_router
 app = FastAPI(title="jarchive-verifier")
 
 
-# Routers
-app.include_router(jarchive_router, prefix="/ja", tags=["J! Archive"])
+# Routers (router has its own prefix/tags)
+app.include_router(jarchive_router)
 
 
 @app.get("/")
