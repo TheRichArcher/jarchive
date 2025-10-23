@@ -1,4 +1,5 @@
 import re
+import html
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Query
@@ -86,57 +87,99 @@ def parse_episode(url: str) -> dict:
         "url": url,
     }
 
-def extract_category_items(html: str, category_title: str):
-    soup = BeautifulSoup(html, "html.parser")
+def extract_category_items(html_text: str, category_title: str):
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    def parse_correct_response_from_onmouseover(attr_val: str) -> str:
+        """
+        Older J! Archive stores a small HTML snippet in the onmouseover attribute.
+        Example contains: <em class="correct_response">ANSWER</em>
+        We unescape and then regex out the inner text.
+        """
+        if not attr_val:
+            return ""
+        try:
+            unescaped = html.unescape(attr_val)
+            # Common patterns: <em class="correct_response">X</em> or <em>X</em>
+            m = re.search(r'<em[^>]*class=["\']?correct_response["\']?[^>]*>(.*?)</em>', unescaped, flags=re.IGNORECASE|re.DOTALL)
+            if m:
+                return BeautifulSoup(m.group(1), "html.parser").get_text(" ", strip=True)
+            # Fallback: any <em>…</em>
+            m2 = re.search(r'<em[^>]*>(.*?)</em>', unescaped, flags=re.IGNORECASE|re.DOTALL)
+            if m2:
+                return BeautifulSoup(m2.group(1), "html.parser").get_text(" ", strip=True)
+        except Exception:
+            pass
+        return ""
 
     def extract_from_round(round_id: str):
         tbl = soup.select_one(f"table#{round_id}")
         if not tbl:
             return None
-        categories = [c.get_text(strip=True) for c in tbl.select("td.category_name")]
+
+        # Columns (categories) at top of the table
+        categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
         if category_title not in categories:
             return None
         col_idx = categories.index(category_title)
 
-        # Collect clue rows and capture the cell for our category column
-        clue_rows = [r for r in tbl.select("tr") if r.select_one("td.clue")]
-        items = []
-        for r in clue_rows:
-            clue_cells = r.select("td.clue")
-            if len(clue_cells) < 6:
-                continue
-            cell = clue_cells[col_idx]
+        # Determine expected board values by round
+        if round_id == "double_jeopardy_round":
+            norm_values = ["$400", "$800", "$1200", "$1600", "$2000"]
+        else:
+            norm_values = ["$200", "$400", "$600", "$800", "$1000"]
 
-            # clue text
+        # Each row with clues has 6 td.clue cells (one per category column).
+        # Some cells may be missing; we keep placeholders and only count valid ones.
+        items = []
+        for r in tbl.select("tr"):
+            cells = r.select("td.clue")
+            if len(cells) < 6:
+                continue
+            cell = cells[col_idx]
+
+            # Clue text
             clue_text_el = cell.select_one(".clue_text, td.clue_text, div.clue_text")
             clue_text = clue_text_el.get_text(" ", strip=True) if clue_text_el else ""
 
-            # correct response
-            correct_el = cell.select_one(".correct_response, em.correct_response, div em")
-            answer_exact = correct_el.get_text(" ", strip=True) if correct_el else ""
+            # Correct response: modern first, legacy fallback
+            answer_exact = ""
+            correct_el = cell.select_one(".correct_response, em.correct_response")
+            if correct_el:
+                answer_exact = correct_el.get_text(" ", strip=True)
 
-            # fallback: legacy onmouseover HTML contains <em>correct response</em>
             if not answer_exact:
-                mouseover = cell.select_one("[onmouseover]")
-                if mouseover:
-                    try:
-                        inner = BeautifulSoup(mouseover.get("onmouseover"), "html.parser")
-                        em = inner.find("em")
-                        if em:
-                            answer_exact = em.get_text(" ", strip=True)
-                    except Exception:
-                        pass
+                # Legacy: attribute contains mini HTML
+                # Often on the <td class="clue"> itself or on a <div> child
+                onmouseover_holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
+                if onmouseover_holder:
+                    answer_exact = parse_correct_response_from_onmouseover(onmouseover_holder.get("onmouseover", ""))
 
+            # Only append if we found at least clue or answer (some cells are empty)
             if clue_text or answer_exact:
                 items.append({"clue_raw": clue_text, "answer_exact": answer_exact})
 
-        # Enforce five items in standard board order
-        norm_values = ["$200", "$400", "$600", "$800", "$1000"]
-        result = []
-        for i, it in enumerate(items[:5]):
-            result.append({"value": norm_values[i], **it})
-        return result if len(result) == 5 else None
+            # Stop early if we already have 5
+            if len(items) >= 5:
+                break
 
+        # Enforce exactly five items in board (top-to-bottom) order for that column
+        if len(items) < 5:
+            return None
+        result = []
+        for i in range(5):
+            it = items[i]
+            result.append({
+                "value": norm_values[i],
+                "clue_raw": it.get("clue_raw", ""),
+                "answer_exact": it.get("answer_exact", ""),
+            })
+        # Require both clue_raw and answer_exact for all five
+        if any(not x["clue_raw"] or not x["answer_exact"] for x in result):
+            return None
+        return result
+
+    # Try Jeopardy then Double Jeopardy
     for rid in ["jeopardy_round", "double_jeopardy_round"]:
         items = extract_from_round(rid)
         if items:
