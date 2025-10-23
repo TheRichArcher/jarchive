@@ -119,8 +119,11 @@ def parse_episode(url: str) -> dict:
 
 def extract_category_items(html_text: str, category_title: str, debug: bool = False):
     soup = BeautifulSoup(html_text, "html.parser")
+    diag = {"round_tried": [], "matched_round": None, "target_category": category_title, "col_idx": None, "rows": []}
 
-    diag_root = {"rounds": []} if debug else None
+    def log(**kv):
+        if debug:
+            diag["rows"].append(kv)
 
     # ---------- helpers ----------
     def _norm_cat(s: str) -> str:
@@ -136,7 +139,6 @@ def extract_category_items(html_text: str, category_title: str, debug: bool = Fa
             return ""
         try:
             unescaped = html.unescape(attr_val)
-            # Prefer classed correct_response
             m = re.search(
                 r'<em[^>]*class=["\']?correct_response["\']?[^>]*>(.*?)</em>',
                 unescaped,
@@ -144,7 +146,6 @@ def extract_category_items(html_text: str, category_title: str, debug: bool = Fa
             )
             if m:
                 return BeautifulSoup(m.group(1), "html.parser").get_text(" ", strip=True)
-            # Fallback: any <em>...</em>
             m2 = re.search(r"<em[^>]*>(.*?)</em>", unescaped, flags=re.IGNORECASE | re.DOTALL)
             if m2:
                 return BeautifulSoup(m2.group(1), "html.parser").get_text(" ", strip=True)
@@ -158,128 +159,79 @@ def extract_category_items(html_text: str, category_title: str, debug: bool = Fa
     # ---------- round extractor using clue ids ----------
     def extract_from_round(round_id: str):
         tbl = soup.select_one(f"table#{round_id}")
-        round_diag = {"round": round_id}
+        diag["round_tried"].append(round_id)
         if not tbl:
-            if debug:
-                round_diag.update({"found": False, "reason": "table not found"})
-                diag_root["rounds"].append(round_diag)
             return None
 
-        # Map round id to clue id prefix and expected values
         if round_id == "double_jeopardy_round":
-            prefix = "DJ"
-            norm_values = ["$400", "$800", "$1200", "$1600", "$2000"]
+            prefix = "DJ"; norm_values = ["$400", "$800", "$1200", "$1600", "$2000"]
         else:
-            prefix = "J"
-            norm_values = ["$200", "$400", "$600", "$800", "$1000"]
+            prefix = "J";  norm_values = ["$200", "$400", "$600", "$800", "$1000"]
 
         raw_categories = [c.get_text(" ", strip=True) for c in tbl.select("td.category_name")]
         cats_norm = [_norm_cat(c) for c in raw_categories]
         target = _norm_cat(category_title)
         if target not in cats_norm:
-            if debug:
-                round_diag.update({"found": False, "reason": "category not present", "categories": cats_norm})
-                diag_root["rounds"].append(round_diag)
             return None
-        col_idx = cats_norm.index(target)          # 0-based index into categories
-        col_num = col_idx + 1                      # 1..6 for clue ids
-        if debug:
-            round_diag.update({"found": True, "col_index": col_idx, "rows": []})
+        col_idx = cats_norm.index(target)     # 0-based
+        col_num = col_idx + 1
+        diag["matched_round"] = round_id
+        diag["col_idx"] = col_idx
 
         items = []
-        # Rows on the board are numbered top-to-bottom 1..5
         for row_num in range(1, 6):
-            row_diag = {"row": row_num} if debug else None
-            # Try the canonical per-clue cell id
-            cell = soup.select_one(f'td#clue_{prefix}_{col_num}_{row_num}')
-            if not cell:
-                # Some legacy templates wrap with a div with that id; try that too
-                cell = soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}')
-                # If it's a div container, move to its closest td for onmouseover, etc.
-                if cell and cell.name == "div":
-                    parent_td = cell.find_parent("td")
-                    cell = parent_td or cell
-            if debug:
-                row_diag and row_diag.update({"has_cell": bool(cell)})
+            cell = soup.select_one(f'td#clue_{prefix}_{col_num}_{row_num}') \
+                   or soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}') \
+                   or None
+            if cell and cell.name == "div":
+                cell = cell.find_parent("td") or cell
 
             if not cell:
-                if debug:
-                    row_diag and row_diag.update({"reason": "missing clue cell"})
-                    round_diag["rows"].append(row_diag)
-                    round_diag["failed_row"] = row_num
-                    diag_root["rounds"].append(round_diag)
+                log(prefix=prefix, row=row_num, step="no_cell", clue_id=f"clue_{prefix}_{col_num}_{row_num}")
                 return None
 
-            # Clue text: prefer .clue_text; otherwise the cell text minus value label
-            clue_text_el = cell.select_one(".clue_text, td.clue_text, div.clue_text")
-            clue_raw = _extract_text(clue_text_el)
+            clue_el = cell.select_one(".clue_text, td.clue_text, div.clue_text")
+            clue_raw = _extract_text(clue_el)
             if not clue_raw:
                 cand = cell.get_text(" ", strip=True)
                 for v in ["$200", "$400", "$600", "$800", "$1000", "$1200", "$1600", "$2000"]:
                     cand = cand.replace(v, "").strip()
                 clue_raw = cand
-            if debug:
-                row_diag and row_diag.update({"has_clue": bool(clue_raw)})
 
-            # Correct response: modern first, then legacy onmouseover
             answer_exact = ""
             correct_el = cell.select_one(".correct_response, em.correct_response")
+            source = None
             if correct_el:
-                answer_exact = _extract_text(correct_el)
-                used = "modern"
-            else:
-                used = None
+                answer_exact = _extract_text(correct_el); source = "in_cell.correct_response"
 
             if not answer_exact:
                 info_div = soup.select_one(f'div#clue_{prefix}_{col_num}_{row_num}')
                 if info_div:
                     correct_el2 = info_div.select_one(".correct_response, em.correct_response")
                     if correct_el2:
-                        answer_exact = _extract_text(correct_el2)
-                        used = used or "info_div"
+                        answer_exact = _extract_text(correct_el2); source = "info_div.correct_response"
 
             if not answer_exact:
                 holder = cell if cell.has_attr("onmouseover") else cell.select_one("[onmouseover]")
                 if holder:
-                    answer_exact = _decode_onmouseover(holder.get("onmouseover", ""))
-                    used = used or "onmouseover"
+                    answer_exact = _decode_onmouseover(holder.get("onmouseover", "")); source = "onmouseover"
 
-            if debug:
-                row_diag and row_diag.update({"has_answer": bool(answer_exact), "answer_source": used})
+            log(prefix=prefix, row=row_num, clue_id=f"clue_{prefix}_{col_num}_{row_num}",
+                clue_ok=bool(clue_raw), ans_ok=bool(answer_exact), source=source,
+                clue_preview=clue_raw[:120], answer_preview=answer_exact[:120])
 
             if not clue_raw or not answer_exact:
-                if debug:
-                    row_diag and row_diag.update({"reason": "missing clue or answer"})
-                    round_diag["rows"].append(row_diag)
-                    round_diag["failed_row"] = row_num
-                    diag_root["rounds"].append(round_diag)
                 return None
 
-            items.append({
-                "value": norm_values[row_num - 1],
-                "clue_raw": clue_raw,
-                "answer_exact": answer_exact,
-            })
-            if debug:
-                round_diag["rows"].append(row_diag)
+            items.append({"value": norm_values[row_num - 1], "clue_raw": clue_raw, "answer_exact": answer_exact})
 
-        if len(items) != 5:
-            if debug:
-                round_diag["reason"] = "not exactly five items"
-                diag_root["rounds"].append(round_diag)
-            return None
-
-        if debug:
-            round_diag["success"] = True
-            diag_root["rounds"].append(round_diag)
         return items
 
-    # Try Jeopardy, then Double Jeopardy
     for rid in ["jeopardy_round", "double_jeopardy_round"]:
-        res = extract_from_round(rid)
-        if res:
-            return res, (diag_root if debug else None)
-    return None, (diag_root if debug else None)
+        items = extract_from_round(rid)
+        if items:
+            return items, diag if debug else None
+    return None, diag if debug else None
 
 @router.get("/extract")
 def ja_extract(episode_url: str = Query(...), category: str = Query(...), debug: bool = Query(False)):
