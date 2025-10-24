@@ -158,10 +158,11 @@ def extract_category_items(html_text: str, category_title: str, debug: bool = Fa
 
     # ---------- round extractor using clue ids ----------
     def extract_from_round(round_id: str):
-        tbl = soup.select_one(f"table#{round_id}")
+        container = soup.select_one(f"#{round_id}")
         diag["round_tried"].append(round_id)
-        if not tbl:
+        if not container:
             return None
+        tbl = container.select_one("table.round") or container.select_one("table") or container
 
         if round_id == "double_jeopardy_round":
             prefix = "DJ"; norm_values = ["$400", "$800", "$1200", "$1600", "$2000"]
