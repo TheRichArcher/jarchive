@@ -5,6 +5,8 @@ import html as _html
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+from typing import List, Optional, Literal
 
 router = APIRouter(prefix="/ja", tags=["jarchive"])
 
@@ -256,5 +258,86 @@ def ja_extract(episode_url: str = Query(...), category: str = Query(...), debug:
         "items": items,
         "debug": diag if debug else None,
     }
+
+class RoundCategories(BaseModel):
+    round: Literal["jeopardy_round", "double_jeopardy_round"]
+    categories: List[str]
+
+
+class CategoriesResponse(BaseModel):
+    episode_url: str
+    episode_number: Optional[int] = None
+    episode_air_date: Optional[str] = None
+    rounds: List[RoundCategories]
+
+
+def _extract_episode_meta_from_soup(soup: BeautifulSoup) -> tuple[Optional[int], Optional[str]]:
+    title_text = _extract_title_text(soup)
+    ep_num, air_date = _parse_episode_meta(title_text)
+
+    if not (ep_num and air_date):
+        header_blk = soup.select_one("#game_title") or soup.select_one("#content") or soup.find("h1")
+        if header_blk:
+            ep_num, air_date = _parse_episode_meta(header_blk.get_text(" ", strip=True))
+
+    ep_int: Optional[int] = None
+    if ep_num:
+        try:
+            ep_int = int(ep_num)
+        except Exception:
+            ep_int = None
+
+    return ep_int, air_date
+
+
+def _extract_round_categories(soup: BeautifulSoup, round_id: str) -> List[str]:
+    container = soup.find(id=round_id)
+    categories: List[str] = []
+    if not container:
+        return categories
+    for td in container.select("td.category_name"):
+        name = td.get_text(" ", strip=True)
+        if name:
+            categories.append(name)
+    return categories
+
+
+@router.get("/categories", response_model=CategoriesResponse)
+def list_categories(
+    episode_url: str = Query(..., description="Full J-Archive game URL"),
+    include_rounds: str = Query("both", description="jeopardy|double|both"),
+):
+    r = requests.get(episode_url, headers=HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Could not fetch episode page: {r.status_code}")
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    episode_number, episode_air_date = _extract_episode_meta_from_soup(soup)
+
+    if include_rounds not in ("jeopardy", "double", "both"):
+        raise HTTPException(status_code=422, detail="include_rounds must be one of 'jeopardy', 'double', 'both'")
+
+    rounds_out: List[RoundCategories] = []
+    if include_rounds in ("jeopardy", "both"):
+        rounds_out.append(
+            RoundCategories(
+                round="jeopardy_round",
+                categories=_extract_round_categories(soup, "jeopardy_round"),
+            )
+        )
+    if include_rounds in ("double", "both"):
+        rounds_out.append(
+            RoundCategories(
+                round="double_jeopardy_round",
+                categories=_extract_round_categories(soup, "double_jeopardy_round"),
+            )
+        )
+
+    return CategoriesResponse(
+        episode_url=episode_url,
+        episode_number=episode_number,
+        episode_air_date=episode_air_date,
+        rounds=rounds_out,
+    )
 
 
