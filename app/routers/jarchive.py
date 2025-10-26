@@ -15,6 +15,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+BASE = "https://www.j-archive.com"
+
 def _extract_title_text(soup: BeautifulSoup) -> str:
     # Try several known locations for the game title
     for sel in [
@@ -338,6 +340,42 @@ def list_categories(
         episode_number=episode_number,
         episode_air_date=episode_air_date,
         rounds=rounds_out,
+    )
+
+class LatestGameResponse(BaseModel):
+    episode_url: str
+    episode_number: Optional[int] = None
+    episode_air_date: Optional[str] = None
+
+
+def _soup(url: str) -> BeautifulSoup:
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Could not fetch page: {r.status_code}")
+    return BeautifulSoup(r.text, "html.parser")
+
+
+@router.get("/latest_game", response_model=LatestGameResponse)
+def latest_game():
+    seasons = _soup(f"{BASE}/listseasons.php")
+    season_link = seasons.select_one("#content table a[href*='showseason.php?season=']")
+    if not season_link:
+        raise HTTPException(status_code=400, detail="Could not find latest season link")
+    season_url = f"{BASE}/{season_link.get('href').lstrip('/')}"
+
+    season = _soup(season_url)
+    game_link = season.select_one("a[href*='showgame.php?game_id=']")
+    if not game_link:
+        raise HTTPException(status_code=400, detail="Could not find latest game link in season")
+    episode_url = f"{BASE}/{game_link.get('href').lstrip('/')}"
+
+    game = _soup(episode_url)
+    episode_number, episode_air_date = _extract_episode_meta_from_soup(game)
+
+    return LatestGameResponse(
+        episode_url=episode_url,
+        episode_number=episode_number,
+        episode_air_date=episode_air_date,
     )
 
 
